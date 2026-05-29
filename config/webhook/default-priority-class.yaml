@@ -1,0 +1,7 @@
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: default
+value: 0
+description: "tekton-kueue default priority class"

@@ -1,0 +1,22 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: tekton-kueue-webhook
+    app.kubernetes.io/managed-by: kustomize
+  name: webhook-service
+  namespace: system
+spec:
+  ports:
+    - name: webhook-server
+      port: 443
+      protocol: TCP
+      targetPort: webhook-server
+    - name: metrics-server
+      port: 8443
+      protocol: TCP
+      targetPort: metrics-server
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: tekton-kueue-webhook

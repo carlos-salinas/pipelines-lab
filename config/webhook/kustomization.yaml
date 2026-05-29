@@ -1,0 +1,23 @@
+kind: Kustomization
+images:
+- name: controller
+  newName: docker.io/library/tekton-kueue
+  newTag: dev
+resources:
+- deployment.yaml
+- manifests.yaml
+- service.yaml
+- default-priority-class.yaml
+
+configurations:
+- kustomizeconfig.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+
+configMapGenerator:
+- files:
+  - config.yaml
+  name: config
+  options:
+    disableNameSuffixHash: true
+    labels:
+      app.kubernetes.io/part-of: tekton-kueue

@@ -1,0 +1,4 @@
+queueName: pipelines-queue
+cel:
+  expressions:
+    - priority("tekton-kueue-default")
