@@ -1,11 +1,11 @@
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: "default-flavor"
 
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: cluster-pipeline-queue
@@ -24,16 +24,17 @@ spec:
       - name: "tekton.dev/pipelineruns"
         nominalQuota: 2
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
+  namespace: default
   name: pipelines-queue
 spec:
   clusterQueue: cluster-pipeline-queue
 
 ---
 # block running pipelines by setting the nominalQuota to 0
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: blocking-cluster-pipeline-queue
@@ -48,9 +49,10 @@ spec:
       - name: "tekton.dev/pipelineruns"
         nominalQuota: 0
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
+  namespace: default
   name: blocking-pipelines-queue
 spec:
   clusterQueue: blocking-cluster-pipeline-queue

@@ -1,14 +1,16 @@
-apiVersion: kueue.x-k8s.io/v1beta1
+# Deprecated monolithic manifest — kept for reference. hack-oc/01-setup-multikueue.sh applies
+# multikueue-core.yaml + multikueue-queues.yaml (OSS) or patches ClusterQueue on OLM hub.
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: "default-flavor"
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: "cluster-queue"
 spec:
-  namespaceSelector: {} # match all.
+  namespaceSelector: {}
   resourceGroups:
     - coveredResources: ["cpu", "memory", "tekton.dev/pipelineruns"]
       flavors:
@@ -20,10 +22,11 @@ spec:
               nominalQuota: 36Gi
             - name: "tekton.dev/pipelineruns"
               nominalQuota: "1"
-  admissionChecks:
-    - sample-multikueue
+  admissionChecksStrategy:
+    admissionChecks:
+      - name: sample-multikueue
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   namespace: "default"
@@ -31,7 +34,7 @@ metadata:
 spec:
   clusterQueue: "cluster-queue"
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck
 metadata:
   name: sample-multikueue
@@ -42,7 +45,7 @@ spec:
     kind: MultiKueueConfig
     name: multikueue-test
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: MultiKueueConfig
 metadata:
   name: multikueue-test

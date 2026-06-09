@@ -24,9 +24,124 @@ KIND_KUBECONFIG_INSECURE_SKIP_TLS_VERIFY="${KIND_KUBECONFIG_INSECURE_SKIP_TLS_VE
 # Published Kind API on host: base port + spoke index (spoke-1 uses base+1). Bound to 0.0.0.0 so CRC VM can reach Mac LAN IP:port.
 KIND_SPOKE_API_BASE_PORT="${KIND_SPOKE_API_BASE_PORT:-7650}"
 KIND_EXPOSE_SPOKE_API_ON_LAN="${KIND_EXPOSE_SPOKE_API_ON_LAN:-true}"
+# CRC hub only: olm = Red Hat operators (Pipelines, cert-manager, Kueue); oss = upstream YAML via Makefile.
+HUB_DEPS_INSTALL="${HUB_DEPS_INSTALL:-olm}"
+
+# Kueue controller namespace on the CRC hub depends on install path (Kind spokes always use OSS).
+hub_kueue_namespace() {
+  case "${HUB_DEPS_INSTALL}" in
+    olm) echo "openshift-kueue-operator" ;;
+    oss) echo "kueue-system" ;;
+    *)
+      echo "Unknown HUB_DEPS_INSTALL=${HUB_DEPS_INSTALL}; use 'olm' or 'oss'." >&2
+      return 1
+      ;;
+  esac
+}
+
+spoke_kueue_namespace() {
+  echo "kueue-system"
+}
+
+# Mac LAN IP (or KIND_API_HOST) where Kind publishes spoke API ports for CRC hub reachability.
+kind_api_publish_host() {
+  if [[ -n "${KIND_API_HOST-}" ]]; then
+    echo "${KIND_API_HOST}"
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    ipconfig getifaddr en0 2>/dev/null \
+      || ipconfig getifaddr en1 2>/dev/null \
+      || ipconfig getifaddr bridge100 2>/dev/null \
+      || true
+  fi
+}
+
+# Min/max TCP port for published Kind spoke APIs (base+index, plus any *.published-api-port files).
+spoke_api_port_range() {
+  local min_port max_port p ppfile
+  min_port=$(( KIND_SPOKE_API_BASE_PORT + 1 ))
+  max_port=$(( KIND_SPOKE_API_BASE_PORT + NUM_WORKERS ))
+  for ppfile in "${TEMP_DIR}"/spoke-*.published-api-port; do
+    [[ -f "${ppfile}" ]] || continue
+    p="$(tr -d '[:space:]' < "${ppfile}" || true)"
+    [[ "${p}" =~ ^[0-9]+$ ]] || continue
+    if (( p < min_port )); then min_port=$p; fi
+    if (( p > max_port )); then max_port=$p; fi
+  done
+  echo "${min_port} ${max_port}"
+}
+
+# RH Kueue operator installs kueue-deny-all; MultiKueue hub controller must reach spoke API servers.
+ensure_kueue_multikueue_egress() {
+  [[ "${HUB_DEPS_INSTALL}" == "olm" ]] || return 0
+
+  local hub_kueue_ns min_port max_port publish_host
+  hub_kueue_ns="$(hub_kueue_namespace)"
+  read -r min_port max_port < <(spoke_api_port_range)
+  publish_host="$(kind_api_publish_host)"
+
+  echo "Ensuring Kueue MultiKueue egress (namespace: ${hub_kueue_ns}, Kind API ports: ${min_port}-${max_port})..." >&2
+  if [[ -n "${publish_host}" ]]; then
+    echo "  Restricting Kind spoke egress to host ${publish_host}/32 (override: KIND_API_HOST)." >&2
+    kubectl --context="${HUB_CONTEXT:?HUB_CONTEXT is not set}" apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kueue-allow-egress-multikueue
+  namespace: ${hub_kueue_ns}
+spec:
+  podSelector:
+    matchLabels:
+      app.openshift.io/name: kueue
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - port: 443
+      protocol: TCP
+    - port: 80
+      protocol: TCP
+  - to:
+    - ipBlock:
+        cidr: ${publish_host}/32
+    ports:
+    - port: ${min_port}
+      endPort: ${max_port}
+      protocol: TCP
+EOF
+  else
+    echo "  Warning: could not detect LAN host; allowing Kind API ports ${min_port}-${max_port} to any destination (set KIND_API_HOST to tighten)." >&2
+    kubectl --context="${HUB_CONTEXT:?HUB_CONTEXT is not set}" apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kueue-allow-egress-multikueue
+  namespace: ${hub_kueue_ns}
+spec:
+  podSelector:
+    matchLabels:
+      app.openshift.io/name: kueue
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - port: 443
+      protocol: TCP
+    - port: 80
+      protocol: TCP
+  - ports:
+    - port: ${min_port}
+      endPort: ${max_port}
+      protocol: TCP
+EOF
+  fi
+}
 
 NUM_WORKERS=${1:-1}
-KUEUE_MANIFEST_URL="https://gist.githubusercontent.com/khrm/a83998529449ae0f0e25c264d4e61dd0/raw/bd7933eea4b509996dbe7a4739ff96dd2101b0e3/gistfile0.txt"
+# Kind spokes must expose kueue.x-k8s.io/v1beta2 (RH Kueue operator 1.3+ on CRC hub uses v1beta2 only).
+# go.mod may pin an older KUEUE_VERSION for tekton-kueue code; override here for cluster installs.
+KUEUE_OSS_VERSION="${KUEUE_OSS_VERSION:-v0.17.3}"
 
 TEMP_DIR="/tmp/tekton-kueue/e2e/multikueue"
 export KUBECONFIG=${KUBECONFIG:-$TEMP_DIR/multikueue.kubeconfig}
@@ -252,6 +367,67 @@ fix_kind_spoke_local_kubeconfig() {
   echo "Local kubectl: kind-${cluserName} -> https://127.0.0.1:${port} (hub spoke kubeconfig uses LAN + tls-server-name)." >&2
 }
 
+# Platform dependencies differ by cluster role:
+#   hub  (CRC)  -> OLM (default) or OSS manifests (HUB_DEPS_INSTALL=oss)
+#   spoke (Kind) -> OSS manifests only (make kueue / tekton / cert-manager)
+install_platform_dependencies() {
+  local clusterType=$1
+  local cluserName=$2
+
+  case "${clusterType}" in
+    hub)
+      case "${HUB_DEPS_INSTALL}" in
+        olm)
+          echo "=== Hub (${cluserName}): installing Pipelines, cert-manager, Kueue via OLM on CRC ===" >&2
+          ( cd "${ROOT}" && make olm-deps-crc )
+          ;;
+        oss)
+          echo "=== Hub (${cluserName}): installing Kueue, Tekton, cert-manager via OSS YAML ===" >&2
+          install_platform_dependencies_oss "${cluserName}"
+          ;;
+        *)
+          echo "Unknown HUB_DEPS_INSTALL=${HUB_DEPS_INSTALL}; use 'olm' or 'oss'." >&2
+          return 1
+          ;;
+      esac
+      ;;
+    spoke|*)
+      echo "=== Spoke (${cluserName}): installing Kueue, Tekton, cert-manager via OSS YAML (Kind) ===" >&2
+      install_platform_dependencies_oss "${cluserName}"
+      ;;
+  esac
+}
+
+install_platform_dependencies_oss() {
+  local cluserName=$1
+  echo "  Installing upstream Kueue ${KUEUE_OSS_VERSION} on ${cluserName} (v1beta2 for MultiKueue hub compatibility)..." >&2
+  ( cd "${ROOT}" && make kueue "KUEUE_VERSION=${KUEUE_OSS_VERSION}" )
+  echo "  Applying upstream Tekton Pipelines and cert-manager (make targets)..." >&2
+  ( cd "${ROOT}" && make tekton cert-manager )
+}
+
+wait_for_platform_dependencies() {
+  local clusterType=$1
+
+  echo "Waiting for cert-manager operand..." >&2
+  kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=300s
+
+  echo "Waiting for Tekton / OpenShift Pipelines..." >&2
+  if [[ "${clusterType}" == "hub" ]] && [[ "${HUB_DEPS_INSTALL}" == "olm" ]]; then
+    # olm-deps-crc already waits on TektonConfig; only re-check if make was skipped.
+    local tc_ready=""
+    tc_ready="$(kubectl get tektonconfig config -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+    if [[ "${tc_ready}" != "True" ]]; then
+      echo "TektonConfig not Ready yet; waiting (use make olm-wait-tektonconfig for details)..." >&2
+      ( cd "${ROOT}" && make olm-wait-tektonconfig )
+    fi
+    kubectl wait --for=condition=Available deployment --all -n "$(hub_kueue_namespace)" --timeout=300s
+  else
+    kubectl wait --for=condition=Available deployment --all -n tekton-pipelines --timeout=300s
+    kubectl wait --for=condition=Available deployment --all -n kueue-system --timeout=300s
+  fi
+}
+
 function create_cluster() {
     local cluserName=$1
     local clusterType="spoke"
@@ -282,7 +458,7 @@ function create_cluster() {
       -z tekton-events-controller \
       -n tekton-pipelines
 
-      echo "Hub uses CRC (OpenShift): skipping kind; image will be built and pushed to the cluster registry."
+      echo "Hub uses CRC (OpenShift): skipping kind; HUB_DEPS_INSTALL=${HUB_DEPS_INSTALL}."
     else
       local spoke_idx=1
       if [[ "${cluserName}" =~ ^spoke- ]]; then
@@ -329,14 +505,7 @@ EOFKIND
       ( cd "${ROOT}" && make load-image "IMG=${IMG}" "KIND_CLUSTER=${cluserName}" )
     fi
 
-    echo "Installing Kueue controller on $cluserName..."
-    kubectl apply --server-side -f ${KUEUE_MANIFEST_URL}
-
-    echo "Waiting for Kueue to be ready..."
-    kubectl wait --for=condition=Available deployment --all -n kueue-system --timeout=300s
-
-    echo "Installing tekton and cert-manager"
-    ( cd "${ROOT}" && make tekton cert-manager )
+    install_platform_dependencies "${clusterType}" "${cluserName}"
 
     local deploy_img="${IMG}"
     if [[ "${clusterType}" == "hub" ]]; then
@@ -365,11 +534,7 @@ EOFKIND
     kubectl rollout status deployment/tekton-kueue-controller-manager -n tekton-kueue --timeout=300s || true
     kubectl rollout status deployment/tekton-kueue-webhook -n tekton-kueue --timeout=300s || true
 
-    echo "Waiting for cert-manager to be ready..."
-    kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=300s
-
-    echo "Waiting for Tekton Pipelines to be ready..."
-    kubectl wait --for=condition=Available deployment --all -n tekton-pipelines --timeout=300s
+    wait_for_platform_dependencies "${clusterType}"
 
     case "${clusterType}" in
       hub)
@@ -377,7 +542,7 @@ EOFKIND
         ;;
       spoke|*)
         echo "Applying spoke worker setup on ${cluserName}..."
-        kubectl apply -f "${ROOT}/config/samples/kueue/kueue-resources.yaml"
+        kubectl apply --server-side -f "${ROOT}/config/samples/kueue/kueue-resources.yaml"
         create_worker_kubeconfig "${cluserName}"
         ;;
     esac
@@ -387,16 +552,34 @@ EOFKIND
 
 
 
+# Apply hub MultiKueue CRs. v1beta2 API changes vs v1beta1:
+#   - ClusterQueue.spec.admissionChecks -> spec.admissionChecksStrategy.admissionChecks[].name
+#   - MultiKueueCluster.spec.kubeConfig -> spec.clusterSource.kubeConfig
+# On CRC+OLM, the Kueue controller owns ClusterQueue.spec.resourceGroups (SSA conflict if re-applied).
+apply_multikueue_hub_resources() {
+  local samples="${ROOT}/config/samples/multikueue"
+
+  echo "Applying MultiKueue hub resources (Kueue v1beta2)..." >&2
+  kubectl apply --server-side -f "${samples}/tekton-kueue-config.yaml"
+  kubectl apply --server-side -f "${samples}/multikueue-core.yaml"
+
+  local cq_name="cluster-queue"
+  if [[ "${HUB_DEPS_INSTALL}" == "olm" ]] && kubectl get clusterqueue "${cq_name}" >/dev/null 2>&1; then
+    echo "  OLM hub: patching ClusterQueue/${cq_name} admissionChecksStrategy (controller owns resourceGroups)." >&2
+    kubectl patch clusterqueue "${cq_name}" --type=merge -p \
+      '{"spec":{"admissionChecksStrategy":{"admissionChecks":[{"name":"sample-multikueue"}]}}}'
+  else
+    kubectl apply --server-side -f "${samples}/multikueue-queues.yaml"
+  fi
+}
+
 # Function to set up the manager cluster
 setup_hub_cluster() {
   cluserName=$1
   echo "Creating $cluserName cluster..."
   create_cluster "${cluserName}" hub
 
-  #Apply MultiKueue Setup
-  kubectl apply --server-side -f $ROOT/config/samples/multikueue/
-
-
+  apply_multikueue_hub_resources
 }
 
 # Function to create a kubeconfig for a worker
@@ -404,7 +587,8 @@ create_worker_kubeconfig() {
     local worker_name=$1
     local kubeconfig_out="$TEMP_DIR/${worker_name}.kubeconfig"
     local multikueue_sa="multikueue-sa"
-    local namespace="kueue-system"
+    local namespace
+    namespace="$(spoke_kueue_namespace)"
 
     kubectl config use-context "kind-${worker_name}"
 
@@ -571,22 +755,26 @@ function add_spoke_to_hub() {
     local kubeconfig_out="$TEMP_DIR/${spoke}.kubeconfig"
 
     local hub_context="${HUB_CONTEXT:?HUB_CONTEXT is not set; run hub (CRC) setup first}"
-    echo "Adding Spoke $spoke into $hub_context"
+    local hub_kueue_ns
+    hub_kueue_ns="$(hub_kueue_namespace)"
+    ensure_kueue_multikueue_egress
+    echo "Adding Spoke $spoke into $hub_context (Kueue namespace: ${hub_kueue_ns})"
     kubectl config use-context "${hub_context}"
-    kubectl --context="${hub_context}" create secret generic "${spoke}-secret" -n kueue-system --from-file=kubeconfig=${kubeconfig_out} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl --context="${hub_context}" create secret generic "${spoke}-secret" -n "${hub_kueue_ns}" --from-file=kubeconfig=${kubeconfig_out} --dry-run=client -o yaml | kubectl apply -f -
 
     # Add Spoke into MultiKueueCluster Config
 
     # Create MultiKueueCluster
     kubectl --context="${hub_context}" apply -f - << EOF
-      apiVersion: kueue.x-k8s.io/v1beta1
+      apiVersion: kueue.x-k8s.io/v1beta2
       kind: MultiKueueCluster
       metadata:
         name: $spoke
       spec:
-        kubeConfig:
-          locationType: Secret
-          location: $spoke-secret
+        clusterSource:
+          kubeConfig:
+            locationType: Secret
+            location: $spoke-secret
 EOF
 
 
@@ -605,15 +793,38 @@ EOF
 }
 
 function validate() {
-  spokes=$1
-    kubectl config use-context "${HUB_CONTEXT:?HUB_CONTEXT is not set}"
-    sleep 10 # Give some time for controllers to reconcile
+  local -a spokes_arr=()
+  if [[ $# -gt 1 ]]; then
+    spokes_arr=("$@")
+  elif [[ $# -eq 1 ]]; then
+    spokes_arr=("$1")
+  fi
 
-    kubectl get clusterqueues cluster-queue -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'CQ - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
-    kubectl get admissionchecks sample-multikueue -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'AC - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
-    for key in ${spokes[@]} ; do
-      kubectl get multikueuecluster $key -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'MC - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
+  kubectl config use-context "${HUB_CONTEXT:?HUB_CONTEXT is not set}"
+
+  local i=0
+  while [[ $i -lt 36 ]]; do
+    local all_active=1 mc
+    for mc in "${spokes_arr[@]}"; do
+      local mc_active
+      mc_active="$(kubectl get multikueuecluster "${mc}" -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)"
+      if [[ "${mc_active}" != "True" ]]; then
+        all_active=0
+        break
+      fi
     done
+    if [[ ${#spokes_arr[@]} -eq 0 || "${all_active}" -eq 1 ]]; then
+      break
+    fi
+    sleep 5
+    i=$((i + 1))
+  done
+
+  kubectl get clusterqueues cluster-queue -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'CQ - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
+  kubectl get admissionchecks sample-multikueue -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'AC - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
+  for key in "${spokes_arr[@]}"; do
+    kubectl get multikueuecluster "${key}" -o jsonpath="{.kind} - {'\t'}{.metadata.name} - {'\t'} {range .status.conditions[?(@.type == 'Active')]}{'MC - Active: '}{@.status}{' Reason: '}{@.reason}{' Message: '}{@.message}{'\n'}{end}"
+  done
 }
 
 function main() {
@@ -636,7 +847,7 @@ function main() {
   done
 
   echo "Setup complete. Verifying..."
-  validate $spokes
+  validate "${spokes[@]}"
 }
 
 main

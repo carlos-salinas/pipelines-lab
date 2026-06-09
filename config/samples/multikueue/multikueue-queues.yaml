@@ -1,0 +1,22 @@
+# ClusterQueue for OSS hub / greenfield installs. On CRC+OLM the Kueue controller owns
+# spec.resourceGroups — apply_multikueue_hub_resources() patches admissionChecks only when the CQ exists.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: "cluster-queue"
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "tekton.dev/pipelineruns"]
+      flavors:
+        - name: "default-flavor"
+          resources:
+            - name: "cpu"
+              nominalQuota: 9
+            - name: "memory"
+              nominalQuota: 36Gi
+            - name: "tekton.dev/pipelineruns"
+              nominalQuota: "1"
+  admissionChecksStrategy:
+    admissionChecks:
+      - name: sample-multikueue
