@@ -138,7 +138,13 @@ EOF
   fi
 }
 
-NUM_WORKERS=${1:-1}
+# Provision phase: all (default) | hub | spokes — set via MULTIKUEUE_PHASE or Makefile targets.
+MULTIKUEUE_PHASE="${MULTIKUEUE_PHASE:-all}"
+# Optional first positional arg remains the worker count for backward compatibility.
+if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+  NUM_WORKERS="$1"
+fi
+NUM_WORKERS="${NUM_WORKERS:-1}"
 # Kind spokes must expose kueue.x-k8s.io/v1beta2 (RH Kueue operator 1.3+ on CRC hub uses v1beta2 only).
 # go.mod may pin an older KUEUE_VERSION for tekton-kueue code; override here for cluster installs.
 KUEUE_OSS_VERSION="${KUEUE_OSS_VERSION:-v0.17.3}"
@@ -215,6 +221,25 @@ select_crc_context() {
   fi
   kubectl config use-context "${HUB_CONTEXT}"
   echo "Using hub kubeconfig context: ${HUB_CONTEXT}"
+}
+
+# Spokes-only phase: merge CRC admin context and verify hub MultiKueue CRs exist.
+ensure_hub_available() {
+  if [[ -z "${HUB_CONTEXT}" ]]; then
+    ensure_crc_started
+    merge_crc_kubeconfig
+    select_crc_context
+  elif ! kubectl config get-contexts -o name 2>/dev/null | grep -qx "${HUB_CONTEXT}"; then
+    echo "HUB_CONTEXT=${HUB_CONTEXT} not found in KUBECONFIG; merging CRC kubeconfig..." >&2
+    merge_crc_kubeconfig
+    select_crc_context
+  fi
+
+  if ! kubectl --context="${HUB_CONTEXT}" get multikueueconfig multikueue-test >/dev/null 2>&1; then
+    echo "Hub is missing MultiKueueConfig/multikueue-test. Run 'make provision-hub' first." >&2
+    exit 1
+  fi
+  echo "Hub context ${HUB_CONTEXT} is reachable and MultiKueue is configured." >&2
 }
 
 # Assume ${built_ref} already exists locally (make docker-build). Tag & push to OpenShift registry (CRC / OCP hub).
@@ -514,17 +539,21 @@ EOFKIND
       deploy_img="$(push_tekton_kueue_to_crc "${IMG}")"
     fi
 
-    echo "Deploying Tekton-Kueue controller (pull spec: ${deploy_img})..."
-    ( cd "${ROOT}" && make deploy "IMG=${deploy_img}" )
-
-    # Kind: never hit docker.io — use the tarball loaded via kind load image-archive only.
+    # Kind loads images as localhost/<repo>:<tag>; :latest defaults to imagePullPolicy=Always, so
+    # apply manifests first, patch local image + Never, then wait (make deploy waits too early).
     if [[ "${clusterType}" != "hub" ]]; then
-      echo "Kind spoke: forcing imagePullPolicy=Never so kubelet uses the loaded image (${deploy_img})..." >&2
+      deploy_img="localhost/${deploy_img}"
+      echo "Deploying Tekton-Kueue on Kind spoke (local image: ${deploy_img}, imagePullPolicy=Never)..." >&2
+      ( cd "${ROOT}" && make deploy-apply "IMG=${deploy_img}" )
       for dep in tekton-kueue-controller-manager tekton-kueue-webhook; do
         kubectl patch deployment/"${dep}" -n tekton-kueue --type=json \
           -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]' 2>/dev/null \
           || echo "Could not patch imagePullPolicy for ${dep} (does it exist yet?)." >&2
       done
+      kubectl wait --for=condition=Available deployment --all -n tekton-kueue --timeout=300s
+    else
+      echo "Deploying Tekton-Kueue controller (pull spec: ${deploy_img})..."
+      ( cd "${ROOT}" && make deploy "IMG=${deploy_img}" )
     fi
 
     echo "Waiting for cert-manager Certificates in tekton-kueue (metrics/webhook TLS secrets)..." >&2
@@ -827,27 +856,45 @@ function validate() {
   done
 }
 
-function main() {
-#  docker run -d --restart=always -p "127.0.0.1:5001:5000" --name "kind-registry" registry:2
-#  docker network connect "kind" "kind-registry"
-  echo "Building Tekton-Kueue"
+provision_spokes_and_connect() {
+  local spokes=()
+  local i cluserName
 
-  # Setup Hub Cluster
-  setup_hub_cluster "hub"
-  echo "##########  Hub is Ready"
-  # Setup  Spoke Clusters
-  spokes=()
-   for i in $(seq 1 "${NUM_WORKERS}"); do
-    local cluserName="spoke-${i}"
-    setup_spoke_cluster $cluserName
-    add_spoke_to_hub $cluserName
-    spokes+=($cluserName)
-    echo "Validate Newly added spoke"
-    validate $cluserName
+  for i in $(seq 1 "${NUM_WORKERS}"); do
+    cluserName="spoke-${i}"
+    setup_spoke_cluster "${cluserName}"
+    add_spoke_to_hub "${cluserName}"
+    spokes+=("${cluserName}")
+    echo "Validate newly added spoke"
+    validate "${cluserName}"
   done
 
   echo "Setup complete. Verifying..."
   validate "${spokes[@]}"
+}
+
+function main() {
+  echo "MultiKueue provision (phase=${MULTIKUEUE_PHASE}, workers=${NUM_WORKERS}, hub_deps=${HUB_DEPS_INSTALL})"
+
+  case "${MULTIKUEUE_PHASE}" in
+    all)
+      setup_hub_cluster "hub"
+      echo "##########  Hub is Ready"
+      provision_spokes_and_connect
+      ;;
+    hub)
+      setup_hub_cluster "hub"
+      echo "##########  Hub is Ready (spokes skipped; run make provision-spokes)"
+      ;;
+    spokes)
+      ensure_hub_available
+      provision_spokes_and_connect
+      ;;
+    *)
+      echo "Unknown MULTIKUEUE_PHASE=${MULTIKUEUE_PHASE}; use all, hub, or spokes." >&2
+      exit 1
+      ;;
+  esac
 }
 
 main

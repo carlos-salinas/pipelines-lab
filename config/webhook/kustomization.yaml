@@ -1,8 +1,8 @@
 kind: Kustomization
 images:
 - name: controller
-  newName: docker.io/library/tekton-kueue
-  newTag: dev
+  newName: localhost/konflux-ci/tekton-kueue
+  newTag: latest
 resources:
 - deployment.yaml
 - manifests.yaml

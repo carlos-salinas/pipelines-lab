@@ -41,10 +41,19 @@ oc get packagemanifest kueue-operator -o jsonpath='{range .status.channels[*]}{.
 `hack-oc/01-setup-multikueue.sh` uses OLM on the CRC hub by default (`HUB_DEPS_INSTALL=olm`).
 Kind spokes still use OSS manifests (`make kueue tekton cert-manager`).
 
+Makefile targets (from repo root):
+
+```bash
+make provision              # hub + spokes (NUM_WORKERS=1 default)
+make provision-hub          # CRC hub only
+make provision-spokes       # Kind spokes + hub registration (hub must exist)
+make provision-spokes NUM_WORKERS=2
+```
+
 To use upstream YAML on the hub instead:
 
 ```bash
-HUB_DEPS_INSTALL=oss hack-oc/01-setup-multikueue.sh
+make provision HUB_DEPS_INSTALL=oss
 ```
 
 ## Troubleshooting (CRC)
@@ -122,3 +131,25 @@ make olm-openshift-pipelines OLM_PIPELINES_CHANNEL=pipelines-1.22
 **Channel `latest` on CRC**
 
 CRC’s packagemanifest default is often `latest`. The Makefile pins `OLM_PIPELINES_CHANNEL=pipelines-1.22` by default.
+
+**No space on Podman machine** (`no space left on device`, `make docker-build` / `podman push` fails)
+
+CRC and `make provision*` image builds use the **Podman machine** VM on macOS. When its disk is full:
+
+```bash
+podman machine start
+podman system df
+podman system prune -a
+podman builder prune -a
+```
+
+Re-check with `podman system df`, then retry your build (`make docker-build`, `make provision-hub`, etc.).
+
+If still full, recreate the machine (removes all images/containers in the VM):
+
+```bash
+podman machine stop
+podman machine rm
+podman machine init
+podman machine start
+```

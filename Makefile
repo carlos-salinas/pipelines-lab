@@ -159,11 +159,14 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
-.PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+.PHONY: deploy-apply
+deploy-apply: manifests kustomize ## Apply controller manifests without waiting for rollouts.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	cd config/webhook && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply --server-side -f -
+
+.PHONY: deploy
+deploy: deploy-apply ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	$(KUBECTL) wait --for=condition=Available deployment --all -n tekton-kueue --timeout=300s
 
 .PHONY: undeploy
@@ -456,6 +459,35 @@ olm-kueue:
 # Full hub stack (cert-manager -> pipelines+SCC+TektonConfig -> kueue). Used by hack-oc/01-setup-multikueue.sh.
 olm-deps-crc: olm-cert-manager olm-openshift-pipelines olm-kueue
 	@echo "OLM hub dependencies ready (cert-manager, OpenShift Pipelines, Kueue)."
+
+##@ MultiKueue (CRC hub + Kind spokes)
+
+MULTIKUEUE_SCRIPT ?= hack-oc/01-setup-multikueue.sh
+MULTIKUEUE_KUBECONFIG ?= /tmp/tekton-kueue/e2e/multikueue/multikueue.kubeconfig
+NUM_WORKERS ?= 1
+HUB_DEPS_INSTALL ?= olm
+
+.PHONY: provision provision-hub provision-spokes provision-run
+
+# Shared env for hack-oc/01-setup-multikueue.sh (phase set by each public target).
+provision-run:
+	@test -f "$(MULTIKUEUE_SCRIPT)" || { echo "Missing $(MULTIKUEUE_SCRIPT)"; exit 1; }
+	MULTIKUEUE_PHASE=$(MULTIKUEUE_PHASE) \
+	NUM_WORKERS=$(NUM_WORKERS) \
+	KUBECONFIG=$(MULTIKUEUE_KUBECONFIG) \
+	HUB_DEPS_INSTALL=$(HUB_DEPS_INSTALL) \
+	KUEUE_OSS_VERSION=$(KUEUE_OSS_VERSION) \
+	IMG=$(IMG) \
+	bash "$(MULTIKUEUE_SCRIPT)"
+
+provision: ## Provision CRC hub and Kind spokes end-to-end
+	@$(MAKE) provision-run MULTIKUEUE_PHASE=all NUM_WORKERS=$(NUM_WORKERS)
+
+provision-hub: ## Provision CRC hub only (OLM deps, tekton-kueue, MultiKueue CRs)
+	@$(MAKE) provision-run MULTIKUEUE_PHASE=hub
+
+provision-spokes: ## Provision Kind spokes and register them with the hub
+	@$(MAKE) provision-run MULTIKUEUE_PHASE=spokes NUM_WORKERS=$(NUM_WORKERS)
 
 .PHONY: load-image
 load-image: docker-build
